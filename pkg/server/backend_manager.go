@@ -24,6 +24,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"k8s.io/klog/v2"
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	pkgagent "sigs.k8s.io/apiserver-network-proxy/pkg/agent"
@@ -85,7 +88,24 @@ type backend struct {
 func (b *backend) Send(p *client.Packet) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.conn.Send(p)
+	// https://github.com/grpc/grpc-go/issues/1229
+	// wrap a timer for around SendMsg to avoid blocking grpc call
+	// (e.g. stream is full)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- b.conn.Send(p)
+		close(errChan)
+	}()
+	t := time.NewTimer(10 * time.Second)
+	select {
+	case <-t.C:
+		return status.Errorf(codes.DeadlineExceeded, "conn.Send has timed out")
+	case err := <-errChan:
+		if !t.Stop() {
+			<-t.C
+		}
+		return err
+	}
 }
 
 func (b *backend) Context() context.Context {
